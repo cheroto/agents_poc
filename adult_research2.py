@@ -15,8 +15,10 @@ load_dotenv()
 # Set MODEL to use local Ollama model (or configure as needed)
 MODEL = os.getenv("MODEL", "ollama/qwen2.5-coder")
 API_BASE = os.getenv("API_BASE", "http://localhost:11434")
-MAX_STEPS = int(os.getenv("MAX_STEPS", 20))  # Adjust as needed
-CHUNK_SIZE = 5  # Number of search results to process per LLM call
+
+# Adjust as needed
+MAX_STEPS = int(os.getenv("MAX_STEPS", 20))
+CHUNK_SIZE = 5
 
 ###############################################################################
 # Pydantic models
@@ -41,7 +43,6 @@ class State(BaseModel):
     consecutive_no_new_results: int = 0
     previous_queries: List[str] = Field(default_factory=list)
 
-    # (Optional) Allows extra fields if the graph returns keys
     class Config:
         extra = "allow"
 
@@ -60,26 +61,21 @@ class SceneInfo(BaseModel):
 # Helper functions
 ###############################################################################
 
-def extract_json(response: str):
-    """
-    Extract JSON from the response string.
-    This function removes Markdown-style triple backticks if present,
-    and then attempts to parse the result.
-    Works for both JSON objects and JSON arrays.
-    """
-    response = response.strip()
-    # Remove markdown formatting if present
-    markdown_pattern = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
-    match = markdown_pattern.search(response)
-    if match:
-        json_str = match.group(1)
-    else:
-        json_str = response
+# By default, do not specify backend="api", which often returns fewer results.
+search_tool = DuckDuckGoSearchResults(output_format="list")
 
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError:
-        return None
+def extract_json(response: str) -> dict:
+    """
+    Extract the FIRST {...} JSON object found in the response string.
+    Handles triple backticks or other wrappers by a simple regex match.
+    """
+    match = re.search(r'\{.*?\}', response, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            return {}
+    return {}
 
 def llm_call(prompt: str) -> str:
     """
@@ -104,11 +100,13 @@ def llm_call(prompt: str) -> str:
 ###############################################################################
 
 def initialize_state_node(state: State) -> Dict[str, Any]:
-    query = state.original_query
-    print(f"Initializing state with query: {query}")
+    """
+    Node 1: Initialize the state. We do NOT return 'report' here; we only do in-place updates.
+    """
+    print(f"Initializing state with query: {state.original_query}")
+    state.report.query = state.original_query
     return {
-        "report": {"query": query, "results": [], "sources": [], "notes": ""},
-        "current_query": query,
+        "current_query": state.original_query,
         "databases": [],
         "search_results": [],
         "step_count": 0,
@@ -121,62 +119,57 @@ def initialize_state_node(state: State) -> Dict[str, Any]:
 
 def query_refinement_node(state: State) -> Dict[str, Any]:
     """
-    Asks the LLM for a refined web search query. If it's identical to previous queries,
-    we can detect that to avoid infinite loops.
+    Node 2: Ask LLM for a refined query. We do in-place updates on state as needed.
     """
     current_query = state.current_query
     result_count = len(state.report.results)
 
     prompt = (
         f"You are assisting a researcher investigating adult content featuring Rebecca Linares. "
-        f"Given the current search query: '{current_query}', and the fact that {result_count} "
-        f"relevant results have been found so far, please suggest a refined search query. "
-        f"Try to include specific keywords such as 'scene', 'studio', or other relevant terms "
-        f"that might yield more specific results. Output JSON with key 'refined_query'."
+        f"Given the current search query: '{current_query}', and {result_count} relevant results, "
+        "suggest a refined web search query with specific keywords (e.g. 'scene', 'studio', 'fetish') "
+        "Output JSON with key 'refined_query'."
     )
     response = llm_call(prompt)
-    extracted_json = extract_json(response)
+    data = extract_json(response)
     try:
-        refined_query_data = RefinedQuery(**(extracted_json or {}))
-        refined_query = refined_query_data.refined_query.strip()
+        refined = RefinedQuery(**data)
+        refined_query = refined.refined_query.strip()
     except ValidationError as e:
         print(f"Validation error in query refinement: {e}")
         refined_query = current_query
-    
-    print(f"Refined query: {refined_query}")
 
-    new_previous_queries = state.previous_queries + [refined_query]
+    print(f"Refined query: {refined_query}")
+    state.previous_queries.append(refined_query)
+
     return {
         "current_query": refined_query,
-        "previous_queries": new_previous_queries
+        "previous_queries": state.previous_queries
     }
 
 def database_selection_node(state: State) -> Dict[str, Any]:
     """
-    Asks the LLM to generate a search query for adult websites or databases
-    that might contain info about the current query, then runs a search
-    to identify relevant domains.
+    Node 3: LLM generates a search query to find adult content websites or DBs. Then we do a short search.
     """
     current_query = state.current_query
     prompt = (
-        f"Generate a search query that might reveal websites or databases with "
-        f"information about '{current_query}'. Use terms like 'adult database', "
-        f"'porn site', or specific known adult content platforms. Output JSON "
-        f"with key 'search_query'."
+        f"Generate a search query that might reveal adult websites or databases for '{current_query}'. "
+        "Use terms like 'adult database', 'porn site', or known adult content platforms. "
+        "Output JSON with key 'search_query'."
     )
     response = llm_call(prompt)
-    extracted_json = extract_json(response)
+    data = extract_json(response)
 
     try:
-        search_query_data = SearchQuery(**(extracted_json or {}))
-        search_query = search_query_data.search_query.strip()
+        sq = SearchQuery(**data)
+        search_query = sq.search_query.strip()
     except ValidationError as e:
         print(f"Validation error in database selection: {e}")
         search_query = current_query
 
     print(f"Search query for databases: {search_query}")
 
-    # Run the search using DuckDuckGoSearchResults
+    # Run the search
     try:
         results = search_tool.invoke(search_query)
         print(f"Search results for databases: {results}")
@@ -184,27 +177,26 @@ def database_selection_node(state: State) -> Dict[str, Any]:
         print(f"Error during search_tool.invoke: {e}")
         results = []
 
-    # Identify domains from the results
+    # Identify unique domains
     domains = []
-    for result in results:
-        url = result.get('link', '')
+    for r in results:
+        url = (r.get('link') or "").strip()
         domain = urlparse(url).netloc
         if domain and domain not in domains:
             domains.append(domain)
 
-    # Combine with existing useful_databases, remove duplicates
+    # Merge with known DBs
     all_domains = list(set(domains + state.useful_databases))
-    # Keep a "general" fallback
-    databases = [{"type": "site", "url": domain} for domain in all_domains] + [{"type": "general"}]
-    print(f"Selected databases: {databases}")
+    new_db = [{"type": "site", "url": d} for d in all_domains] + [{"type": "general"}]
+    print(f"Selected databases: {new_db}")
 
-    return {"databases": databases}
+    return {"databases": new_db}
 
 def search_node(state: State) -> Dict[str, Any]:
     """
-    Searches each selected database (domain) or performs a general search for the current_query.
+    Node 4: Search each domain or do a general search, collect combined results in one list.
     """
-    combined_results = []
+    combined = []
     for db in state.databases:
         if db["type"] == "site":
             query = f"site:{db['url']} {state.current_query}"
@@ -215,129 +207,140 @@ def search_node(state: State) -> Dict[str, Any]:
         try:
             results = search_tool.invoke(query)
             print(f"Search results: {results}")
-            combined_results.extend(results)
+            combined.extend(results)
         except Exception as e:
-            print(f"Error during search_tool.invoke for query '{query}': {e}")
+            print(f"Error searching '{query}': {e}")
 
-    return {"search_results": combined_results}
+    return {"search_results": combined}
 
 def data_processing_node(state: State) -> Dict[str, Any]:
     """
-    Takes the raw search results, calls the LLM to extract scene info,
-    and appends them to the report if relevant.
+    Node 5: For each chunk of search_results, call LLM to parse out scene/studio/link,
+    then store in state.report.results if new.
     """
-    report = state.report
-    useful_databases = state.useful_databases
     search_results = state.search_results
-
     print(f"Processing {len(search_results)} search results")
-    new_results_found = False
+    new_found = False
 
     for i in range(0, len(search_results), CHUNK_SIZE):
-        chunk = search_results[i:i + CHUNK_SIZE]
-        # Format the prompt for the chunk
+        chunk = search_results[i:i+CHUNK_SIZE]
         results_text = "\n".join([
-            f"{idx+1}. Title: {res.get('title','')}\n   Link: {res.get('link','')}\n   Snippet: {res.get('snippet','')}"
-            for idx, res in enumerate(chunk)
+            f"{idx+1}. Title: {r.get('title','')}\n   Link: {r.get('link','')}\n   Snippet: {r.get('snippet','')}"
+            for idx, r in enumerate(chunk)
         ])
 
         prompt = (
             "You are extracting data about specific adult film scenes featuring Rebecca Linares.\n\n"
-            "Below are some search results:\n"
-            f"{results_text}\n\n"
-            "For each result that specifically mentions or suggests an adult scene with Rebecca Linares, "
-            "extract:\n- scene name (as 'scene')\n- studio or production company (as 'studio')\n- direct link (as 'link')\n\n"
+            f"Below are search results:\n{results_text}\n\n"
+            "For each result referencing a specific scene with Rebecca Linares, extract:\n"
+            "- scene (as 'scene')\n"
+            "- studio or production company (as 'studio')\n"
+            "- direct link (as 'link')\n\n"
             "Return a JSON array of objects with keys [scene, studio, link]. "
-            "If a result does not appear to reference an actual scene with Rebecca Linares, omit it."
+            "If a result is not relevant, omit it."
         )
         response = llm_call(prompt)
-        extracted_scenes = extract_json(response)
-        if not isinstance(extracted_scenes, list):
+        try:
+            extracted_scenes = json.loads(response)
+            if not isinstance(extracted_scenes, list):
+                extracted_scenes = []
+        except json.JSONDecodeError:
             extracted_scenes = []
 
         for scene_data in extracted_scenes:
             try:
                 scene_info = SceneInfo(**scene_data)
-                scene = {
-                    "scene": scene_info.scene,
-                    "studio": scene_info.studio,
-                    "link": scene_info.link
+                # Clean/truncate whitespace
+                link_str = scene_info.link.strip()
+                domain = urlparse(link_str).netloc.strip()
+
+                # Build the new scene record
+                new_scene = {
+                    "scene": scene_info.scene.strip(),
+                    "studio": scene_info.studio.strip(),
+                    "link": link_str,
+                    "verification": f"Source: {domain}, manual verification needed"
                 }
-                domain = urlparse(scene["link"]).netloc
-                scene["verification"] = f"Source: {domain}, manual verification needed"
 
-                # Only add if not already in results
-                if not any(r.get("link") == scene["link"] for r in report.results):
-                    report.results.append(scene)
-                    new_results_found = True
-                    print(f"Added scene: {scene['scene']} (Studio: {scene['studio']}, Link: {scene['link']})")
+                # Check duplicates
+                already_exists = any(
+                    (r.get("link") or "").strip() == link_str
+                    for r in state.report.results
+                )
+                if already_exists:
+                    print(f"Duplicate link found, skipping: {link_str}")
+                else:
+                    state.report.results.append(new_scene)
+                    new_found = True
+                    print(f"Added scene: {new_scene['scene']} (Link: {link_str})")
 
-                    if domain and domain not in report.sources:
-                        report.sources.append(domain)
+                    # Add domain to sources
+                    if domain and domain not in state.report.sources:
+                        state.report.sources.append(domain)
                         print(f"Added source: {domain}")
 
-                    if domain and domain not in useful_databases:
-                        useful_databases.append(domain)
+                    # Also add domain to useful_databases
+                    if domain and domain not in state.useful_databases:
+                        state.useful_databases.append(domain)
 
             except ValidationError as e:
-                print(f"Validation error for scene data {scene_data}: {e}")
+                print(f"Scene data validation error: {e}")
                 continue
 
-    if new_results_found:
+    if new_found:
         print("New relevant results found. Resetting consecutive_no_new_results.")
-        consecutive_count = 0
+        consecutive = 0
     else:
-        consecutive_count = state.consecutive_no_new_results + 1
-        print(f"No new results this round. consecutive_no_new_results = {consecutive_count}")
+        consecutive = state.consecutive_no_new_results + 1
+        print(f"No new results this round. consecutive_no_new_results = {consecutive}")
 
-    print(f"Processed results. Current result count: {len(report.results)}")
+    print(f"Processed results. Current result count: {len(state.report.results)}")
+
+    # DO NOT RETURN 'report' here! Just return updated fields.
     return {
-        "report": report,
         "search_results": [],
-        "useful_databases": useful_databases,
-        "consecutive_no_new_results": consecutive_count
+        "consecutive_no_new_results": consecutive,
+        "useful_databases": state.useful_databases
     }
 
 def quality_check_node(state: State) -> Dict[str, Any]:
     """
-    Checks if we have enough results or if we've tried too many times.
-    If we haven't found anything new for N times, we also stop early.
+    Node 6: Decide if we have enough results or if we should continue refining.
     """
     state.step_count += 1
-    target_results = 3  # For demonstration, stop after we find 3 relevant results
-    current_results = len(state.report.results)
-    no_result_limit = 3  # Stop if 3 consecutive tries had no new results
+    target = 3
+    current_count = len(state.report.results)
+    no_result_limit = 3
 
     if (
         state.step_count >= state.max_steps
-        or current_results >= target_results
+        or current_count >= target
         or state.consecutive_no_new_results >= no_result_limit
     ):
         next_node = "response"
-        if state.consecutive_no_new_results >= no_result_limit and current_results == 0:
+        if state.consecutive_no_new_results >= no_result_limit and current_count == 0:
             state.report.notes = "No relevant results found after multiple refinements."
     else:
         next_node = "query_refinement"
 
-    print(f"Step {state.step_count}/{state.max_steps}: {current_results} results found. Next node: {next_node}")
+    print(f"Step {state.step_count}/{state.max_steps}: {current_count} results found. Next node: {next_node}")
     return {"step_count": state.step_count, "next_node": next_node}
 
 def response_node(state: State) -> Dict[str, Any]:
     """
-    Final node: outputs the final aggregated report and stops.
+    Node 7 (Final): Output the final aggregated report as a dictionary.
     """
     print("Generating final report")
-    report = state.report
-    print(f"Final report - Query: {report.query}, Results: {len(report.results)}, Sources: {len(report.sources)}")
-    return {"report": report}
+    print(f"Final report - Query: {state.report.query}, "
+          f"Results: {len(state.report.results)}, "
+          f"Sources: {len(state.report.sources)}")
+    return {"report": state.report.dict()}
 
 ###############################################################################
 # Graph Definition
 ###############################################################################
 
 from langgraph.pregel import GraphRecursionError
-
-search_tool = DuckDuckGoSearchResults(output_format="list")
 
 workflow = StateGraph(State)
 workflow.add_node("initialize", initialize_state_node)
@@ -357,7 +360,7 @@ workflow.add_edge("data_processing", "quality_check")
 
 workflow.add_conditional_edges(
     "quality_check",
-    lambda state: state.next_node,
+    lambda s: s.next_node,
     {"query_refinement": "query_refinement", "response": "response"}
 )
 
@@ -372,17 +375,17 @@ def run_agent(query: str) -> Dict[str, Any]:
     print(f"Starting agent with query: {query}")
     initial_state = State(original_query=query)
     final_data = graph.invoke(initial_state)
-    final_state = State(**dict(final_data))
+    # final_data["report"] is the dictionary from response_node
     print("Agent execution completed")
-    return final_state.report
+    return final_data["report"]
 
 if __name__ == "__main__":
     sample_query = "Find fetish scenes with Rebecca Linares"
-    report = run_agent(sample_query)
+    final_report = run_agent(sample_query)
     print("\n=== Final Report ===")
-    print(f"Query: {report.query}")
+    print(f"Query: {final_report['query']}")
     print("Results:")
-    for result in report.results:
-        print(f"- {result['scene']} (Studio: {result['studio']}, Link: {result['link']}, Verification: {result['verification']})")
-    print(f"Sources: {report.sources}")
-    print(f"Notes: {report.notes}")
+    for r in final_report["results"]:
+        print(f"- Scene: {r['scene']} | Studio: {r['studio']} | Link: {r['link']} | Verification: {r['verification']}")
+    print(f"Sources: {final_report['sources']}")
+    print(f"Notes: {final_report['notes']}")

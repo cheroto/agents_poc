@@ -40,6 +40,10 @@ class State(BaseModel):
     useful_databases: List[str] = Field(default_factory=list)
     consecutive_no_new_results: int = 0
     previous_queries: List[str] = Field(default_factory=list)
+    # Track how many times we have used or seen each domain
+    domain_usage: Dict[str, int] = Field(default_factory=dict)
+    # A list of domains to exclude in subsequent searches (e.g., if we've over-used them)
+    excluded_domains: List[str] = Field(default_factory=list)
 
     # (Optional) Allows extra fields if the graph returns keys
     class Config:
@@ -116,7 +120,9 @@ def initialize_state_node(state: State) -> Dict[str, Any]:
         "next_node": "query_refinement",
         "useful_databases": [],
         "consecutive_no_new_results": 0,
-        "previous_queries": []
+        "previous_queries": [],
+        "domain_usage": {},
+        "excluded_domains": []
     }
 
 def query_refinement_node(state: State) -> Dict[str, Any]:
@@ -128,11 +134,12 @@ def query_refinement_node(state: State) -> Dict[str, Any]:
     result_count = len(state.report.results)
 
     prompt = (
-        f"You are assisting a researcher investigating adult content featuring Rebecca Linares. "
+        f"You are assisting a researcher investigating adult content featuring Rebecca Linares.\n"
         f"Given the current search query: '{current_query}', and the fact that {result_count} "
-        f"relevant results have been found so far, please suggest a refined search query. "
+        f"relevant results have been found so far, please suggest a refined search query.\n"
         f"Try to include specific keywords such as 'scene', 'studio', or other relevant terms "
-        f"that might yield more specific results. Output JSON with key 'refined_query'."
+        f"that might yield more specific results.\n"
+        f"Output JSON with key 'refined_query'."
     )
     response = llm_call(prompt)
     extracted_json = extract_json(response)
@@ -202,13 +209,21 @@ def database_selection_node(state: State) -> Dict[str, Any]:
 
 def search_node(state: State) -> Dict[str, Any]:
     """
-    Searches each selected database (domain) or performs a general search for the current_query.
+    Searches each selected database (domain) or performs a general search 
+    for the current_query. Skips any domains in the excluded_domains list.
     """
     combined_results = []
+    excluded_domains = set(state.excluded_domains)
+
     for db in state.databases:
+        # If it's a site, check whether it's excluded
         if db["type"] == "site":
+            if db["url"] in excluded_domains:
+                print(f"Skipping domain {db['url']} because it is excluded.")
+                continue
             query = f"site:{db['url']} {state.current_query}"
         else:
+            # 'general' search is not domain-specific, so we proceed
             query = state.current_query
         
         print(f"Searching with query: {query}")
@@ -224,11 +239,12 @@ def search_node(state: State) -> Dict[str, Any]:
 def data_processing_node(state: State) -> Dict[str, Any]:
     """
     Takes the raw search results, calls the LLM to extract scene info,
-    and appends them to the report if relevant.
+    and appends them to the report if relevant. Also tracks domain usage.
     """
     report = state.report
     useful_databases = state.useful_databases
     search_results = state.search_results
+    domain_usage = dict(state.domain_usage)  # local copy to update
 
     print(f"Processing {len(search_results)} search results")
     new_results_found = False
@@ -246,7 +262,8 @@ def data_processing_node(state: State) -> Dict[str, Any]:
             "Below are some search results:\n"
             f"{results_text}\n\n"
             "For each result that specifically mentions or suggests an adult scene with Rebecca Linares, "
-            "extract:\n- scene name (as 'scene')\n- studio or production company (as 'studio')\n- direct link (as 'link')\n\n"
+            "extract:\n- scene name (as 'scene')\n- studio or production company (as 'studio')\n"
+            "- direct link (as 'link')\n\n"
             "Return a JSON array of objects with keys [scene, studio, link]. "
             "If a result does not appear to reference an actual scene with Rebecca Linares, omit it."
         )
@@ -279,6 +296,10 @@ def data_processing_node(state: State) -> Dict[str, Any]:
                     if domain and domain not in useful_databases:
                         useful_databases.append(domain)
 
+                # Track the domain usage for these results (even if duplicates)
+                if domain:
+                    domain_usage[domain] = domain_usage.get(domain, 0) + 1
+
             except ValidationError as e:
                 print(f"Validation error for scene data {scene_data}: {e}")
                 continue
@@ -295,7 +316,44 @@ def data_processing_node(state: State) -> Dict[str, Any]:
         "report": report,
         "search_results": [],
         "useful_databases": useful_databases,
-        "consecutive_no_new_results": consecutive_count
+        "consecutive_no_new_results": consecutive_count,
+        "domain_usage": domain_usage
+    }
+
+def review_node(state: State) -> Dict[str, Any]:
+    """
+    This node reviews the domains used so far. If there's excessive usage of any domain,
+    the LLM is asked to reflect on whether we should exclude it. We also use the LLM 
+    to see if we're missing any important domains. The updated excluded domains list is returned.
+    """
+    domain_usage = state.domain_usage
+    # Let's define a simple threshold, for demonstration:
+    usage_threshold = 3
+
+    # List of domains we might exclude because they've been over-used
+    overused_domains = [dom for dom, count in domain_usage.items() if count >= usage_threshold]
+    # Combine with existing excludes
+    new_excluded = set(state.excluded_domains).union(overused_domains)
+
+    # We'll also call the LLM to reflect on coverage. For now, we'll just print it out.
+    # In a real scenario, you could prompt the LLM for additional domain suggestions or adjustments.
+    coverage_prompt = (
+        "We have collected adult scene data from various domains.\n"
+        f"Current domain usage:\n{json.dumps(domain_usage, indent=2)}\n\n"
+        f"Domains excluded so far: {state.excluded_domains}\n"
+        "Please reflect if we are missing important domains or if we have overused certain domains.\n"
+        "Provide a short rationale or next-step advice in JSON under key 'rationale'."
+    )
+    coverage_response = llm_call(coverage_prompt)
+    coverage_json = extract_json(coverage_response)
+    rationale = coverage_json.get("rationale") if isinstance(coverage_json, dict) else None
+    if rationale:
+        print(f"LLM Rationale: {rationale}")
+    else:
+        print("No special rationale from LLM or invalid JSON returned.")
+
+    return {
+        "excluded_domains": list(new_excluded)
     }
 
 def quality_check_node(state: State) -> Dict[str, Any]:
@@ -345,15 +403,21 @@ workflow.add_node("query_refinement", query_refinement_node)
 workflow.add_node("database_selection", database_selection_node)
 workflow.add_node("search", search_node)
 workflow.add_node("data_processing", data_processing_node)
+
+# New node to review usage and possibly exclude overused domains
+workflow.add_node("review_node", review_node)
+
 workflow.add_node("quality_check", quality_check_node)
 workflow.add_node("response", response_node)
 
+# Edges
 workflow.add_edge(START, "initialize")
 workflow.add_edge("initialize", "query_refinement")
 workflow.add_edge("query_refinement", "database_selection")
 workflow.add_edge("database_selection", "search")
 workflow.add_edge("search", "data_processing")
-workflow.add_edge("data_processing", "quality_check")
+workflow.add_edge("data_processing", "review_node")
+workflow.add_edge("review_node", "quality_check")
 
 workflow.add_conditional_edges(
     "quality_check",
