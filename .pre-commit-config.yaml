@@ -1,0 +1,12 @@
+repos:
+- repo: https://github.com/gitleaks/gitleaks.git
+  rev: v8.16.4
+  hooks:
+  - id: gitleaks
+    name: gitleaks
+    entry: gitleaks
+    language: golang
+    args:
+    - detect
+    - --redact
+    pass_filenames: false
