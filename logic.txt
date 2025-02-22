@@ -1,0 +1,25 @@
+Requirements:
+Report Structure must follow the below:
+
+Original Query: ***
+Topic of Research: ***
+
+Results (list)
+Scene Name
+Studio (optional)
+Link
+Cast
+Tags
+Reason why accepted 
+
+
+Get Initial Query
+Do initial websearch to gather more context based on the query.
+Create *n* different queries (configurable) baed on initial query + context found with initial websearch
+Do websearch on all queries and attempt to extract data relevant to query.
+- Websearch num of results need to be configurable
+- For all results that are potential candidates for report, they need to be individually vetted by LLM by asking whether the result actually fits within the context of the query (and provide reasoning)
+- Perform deduplication (can aggregate links and sources for duplicate scenes)
+- Update reports
+Document all domains that were used in this research so far - add them to a state object, and loop the few steps again - but excluding results from these domains (this way we guarantee diversity of results)
+Keep loooping until finish conditions are achieved.

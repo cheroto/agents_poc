@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import datetime
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
 from typing import Dict, Any, List
@@ -44,8 +45,9 @@ class State(BaseModel):
     domain_usage: Dict[str, int] = Field(default_factory=dict)
     # A list of domains to exclude in subsequent searches (e.g., if we've over-used them)
     excluded_domains: List[str] = Field(default_factory=list)
+    # Added search cache to store previous search results
+    search_cache: Dict[str, List[Dict[str, str]]] = Field(default_factory=dict)
 
-    # (Optional) Allows extra fields if the graph returns keys
     class Config:
         extra = "allow"
 
@@ -72,7 +74,6 @@ def extract_json(response: str):
     Works for both JSON objects and JSON arrays.
     """
     response = response.strip()
-    # Remove markdown formatting if present
     markdown_pattern = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
     match = markdown_pattern.search(response)
     if match:
@@ -103,6 +104,14 @@ def llm_call(prompt: str) -> str:
         print(f"Error during LLM call: {e}")
         return "Error: Unable to process the request at this time."
 
+def contains_keywords(text: str, keywords: List[str]) -> bool:
+    """
+    Check if the text contains any of the provided keywords (case-insensitive).
+    Used for filtering irrelevant search results.
+    """
+    text_lower = text.lower()
+    return any(keyword.lower() in text_lower for keyword in keywords)
+
 ###############################################################################
 # Node Functions
 ###############################################################################
@@ -122,7 +131,8 @@ def initialize_state_node(state: State) -> Dict[str, Any]:
         "consecutive_no_new_results": 0,
         "previous_queries": [],
         "domain_usage": {},
-        "excluded_domains": []
+        "excluded_domains": [],
+        "search_cache": {}
     }
 
 def query_refinement_node(state: State) -> Dict[str, Any]:
@@ -134,7 +144,7 @@ def query_refinement_node(state: State) -> Dict[str, Any]:
     result_count = len(state.report.results)
 
     prompt = (
-        f"You are assisting a researcher investigating adult content featuring Rebecca Linares.\n"
+        f"You are assisting a researcher investigating adult content.\n"
         f"Given the current search query: '{current_query}', and the fact that {result_count} "
         f"relevant results have been found so far, please suggest a refined search query.\n"
         f"Try to include specific keywords such as 'scene', 'studio', or other relevant terms "
@@ -183,7 +193,6 @@ def database_selection_node(state: State) -> Dict[str, Any]:
 
     print(f"Search query for databases: {search_query}")
 
-    # Run the search using DuckDuckGoSearchResults
     try:
         results = search_tool.invoke(search_query)
         print(f"Search results for databases: {results}")
@@ -191,7 +200,6 @@ def database_selection_node(state: State) -> Dict[str, Any]:
         print(f"Error during search_tool.invoke: {e}")
         results = []
 
-    # Identify domains from the results
     domains = []
     for result in results:
         url = result.get('link', '')
@@ -199,9 +207,7 @@ def database_selection_node(state: State) -> Dict[str, Any]:
         if domain and domain not in domains:
             domains.append(domain)
 
-    # Combine with existing useful_databases, remove duplicates
     all_domains = list(set(domains + state.useful_databases))
-    # Keep a "general" fallback
     databases = [{"type": "site", "url": domain} for domain in all_domains] + [{"type": "general"}]
     print(f"Selected databases: {databases}")
 
@@ -211,61 +217,72 @@ def search_node(state: State) -> Dict[str, Any]:
     """
     Searches each selected database (domain) or performs a general search 
     for the current_query. Skips any domains in the excluded_domains list.
+    Uses search_cache to avoid redundant searches.
     """
     combined_results = []
     excluded_domains = set(state.excluded_domains)
+    search_cache = dict(state.search_cache)  # Copy existing cache
 
     for db in state.databases:
-        # If it's a site, check whether it's excluded
         if db["type"] == "site":
             if db["url"] in excluded_domains:
                 print(f"Skipping domain {db['url']} because it is excluded.")
                 continue
             query = f"site:{db['url']} {state.current_query}"
         else:
-            # 'general' search is not domain-specific, so we proceed
             query = state.current_query
         
         print(f"Searching with query: {query}")
-        try:
-            results = search_tool.invoke(query)
-            print(f"Search results: {results}")
-            combined_results.extend(results)
-        except Exception as e:
-            print(f"Error during search_tool.invoke for query '{query}': {e}")
+        if query in search_cache:
+            print(f"Using cached results for query: {query}")
+            results = search_cache[query]
+        else:
+            try:
+                results = search_tool.invoke(query)
+                print(f"Search results: {results}")
+                search_cache[query] = results
+            except Exception as e:
+                print(f"Error during search_tool.invoke for query '{query}': {e}")
+                results = []
+        
+        combined_results.extend(results)
 
-    return {"search_results": combined_results}
+    return {"search_results": combined_results, "search_cache": search_cache}
 
 def data_processing_node(state: State) -> Dict[str, Any]:
     """
-    Takes the raw search results, calls the LLM to extract scene info,
+    Takes the raw search results, filters irrelevant ones, calls the LLM to extract scene info,
     and appends them to the report if relevant. Also tracks domain usage.
     """
     report = state.report
     useful_databases = state.useful_databases
-    search_results = state.search_results
-    domain_usage = dict(state.domain_usage)  # local copy to update
+    domain_usage = dict(state.domain_usage)  # Local copy to update
 
-    print(f"Processing {len(search_results)} search results")
+    # Filter search results based on keywords from the original query
+    keywords = state.original_query.lower().split()
+    filtered_results = [
+        res for res in state.search_results
+        if contains_keywords(res.get('title', '') + ' ' + res.get('snippet', ''), keywords)
+    ]
+    print(f"Filtered {len(state.search_results) - len(filtered_results)} out of {len(state.search_results)} search results")
+    print(f"Processing {len(filtered_results)} filtered search results")
     new_results_found = False
 
-    for i in range(0, len(search_results), CHUNK_SIZE):
-        chunk = search_results[i:i + CHUNK_SIZE]
-        # Format the prompt for the chunk
+    for i in range(0, len(filtered_results), CHUNK_SIZE):
+        chunk = filtered_results[i:i + CHUNK_SIZE]
         results_text = "\n".join([
             f"{idx+1}. Title: {res.get('title','')}\n   Link: {res.get('link','')}\n   Snippet: {res.get('snippet','')}"
             for idx, res in enumerate(chunk)
         ])
 
         prompt = (
-            "You are extracting data about specific adult film scenes featuring Rebecca Linares.\n\n"
+            "You are extracting data about specific adult film scenes.\n\n"
             "Below are some search results:\n"
             f"{results_text}\n\n"
-            "For each result that specifically mentions or suggests an adult scene with Rebecca Linares, "
-            "extract:\n- scene name (as 'scene')\n- studio or production company (as 'studio')\n"
+            "Extract:\n- scene name (as 'scene')\n- studio or production company (as 'studio')\n"
             "- direct link (as 'link')\n\n"
             "Return a JSON array of objects with keys [scene, studio, link]. "
-            "If a result does not appear to reference an actual scene with Rebecca Linares, omit it."
+            "If a result does not appear to reference an actual original query, omit it."
         )
         response = llm_call(prompt)
         extracted_scenes = extract_json(response)
@@ -283,7 +300,6 @@ def data_processing_node(state: State) -> Dict[str, Any]:
                 domain = urlparse(scene["link"]).netloc
                 scene["verification"] = f"Source: {domain}, manual verification needed"
 
-                # Only add if not already in results
                 if not any(r.get("link") == scene["link"] for r in report.results):
                     report.results.append(scene)
                     new_results_found = True
@@ -296,7 +312,6 @@ def data_processing_node(state: State) -> Dict[str, Any]:
                     if domain and domain not in useful_databases:
                         useful_databases.append(domain)
 
-                # Track the domain usage for these results (even if duplicates)
                 if domain:
                     domain_usage[domain] = domain_usage.get(domain, 0) + 1
 
@@ -322,21 +337,16 @@ def data_processing_node(state: State) -> Dict[str, Any]:
 
 def review_node(state: State) -> Dict[str, Any]:
     """
-    This node reviews the domains used so far. If there's excessive usage of any domain,
-    the LLM is asked to reflect on whether we should exclude it. We also use the LLM 
+    Reviews the domains used so far. If there's excessive usage of any domain,
+    the LLM is asked to reflect on whether we should exclude it. Also uses the LLM 
     to see if we're missing any important domains. The updated excluded domains list is returned.
     """
     domain_usage = state.domain_usage
-    # Let's define a simple threshold, for demonstration:
     usage_threshold = 3
 
-    # List of domains we might exclude because they've been over-used
     overused_domains = [dom for dom, count in domain_usage.items() if count >= usage_threshold]
-    # Combine with existing excludes
     new_excluded = set(state.excluded_domains).union(overused_domains)
 
-    # We'll also call the LLM to reflect on coverage. For now, we'll just print it out.
-    # In a real scenario, you could prompt the LLM for additional domain suggestions or adjustments.
     coverage_prompt = (
         "We have collected adult scene data from various domains.\n"
         f"Current domain usage:\n{json.dumps(domain_usage, indent=2)}\n\n"
@@ -362,9 +372,9 @@ def quality_check_node(state: State) -> Dict[str, Any]:
     If we haven't found anything new for N times, we also stop early.
     """
     state.step_count += 1
-    target_results = 3  # For demonstration, stop after we find 3 relevant results
+    target_results = 3
     current_results = len(state.report.results)
-    no_result_limit = 3  # Stop if 3 consecutive tries had no new results
+    no_result_limit = 3
 
     if (
         state.step_count >= state.max_steps
@@ -382,10 +392,42 @@ def quality_check_node(state: State) -> Dict[str, Any]:
 
 def response_node(state: State) -> Dict[str, Any]:
     """
-    Final node: outputs the final aggregated report and stops.
+    Final node: outputs the final aggregated report, generates a Markdown report,
+    and saves it to the "reports" folder.
     """
     print("Generating final report")
     report = state.report
+
+    # Generate Markdown report
+    md_content = f"# Report for Query: {report.query}\n\n"
+    md_content += "## Results\n"
+    for result in report.results:
+        md_content += f"- **Scene:** {result['scene']}\n"
+        md_content += f"  - **Studio:** {result['studio']}\n"
+        md_content += f"  - **Link:** {result['link']}\n"
+        md_content += f"  - **Verification:** {result['verification']}\n\n"
+    md_content += "## Sources\n"
+    for source in report.sources:
+        md_content += f"- {source}\n"
+    md_content += "\n## Notes\n"
+    md_content += report.notes if report.notes else "No additional notes."
+
+    # Ensure reports folder exists
+    os.makedirs("reports", exist_ok=True)
+
+    # Generate filename
+    query_slug = re.sub(r'[^\w\-_\.]', '_', report.query)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"reports/report_{query_slug}_{timestamp}.md"
+
+    # Write to file with error handling
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(md_content)
+        print(f"Report saved to {filename}")
+    except Exception as e:
+        print(f"Error saving report: {e}")
+
     print(f"Final report - Query: {report.query}, Results: {len(report.results)}, Sources: {len(report.sources)}")
     return {"report": report}
 
@@ -403,14 +445,10 @@ workflow.add_node("query_refinement", query_refinement_node)
 workflow.add_node("database_selection", database_selection_node)
 workflow.add_node("search", search_node)
 workflow.add_node("data_processing", data_processing_node)
-
-# New node to review usage and possibly exclude overused domains
 workflow.add_node("review_node", review_node)
-
 workflow.add_node("quality_check", quality_check_node)
 workflow.add_node("response", response_node)
 
-# Edges
 workflow.add_edge(START, "initialize")
 workflow.add_edge("initialize", "query_refinement")
 workflow.add_edge("query_refinement", "database_selection")
