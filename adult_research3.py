@@ -20,7 +20,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 MAX_STEPS = int(os.getenv("MAX_STEPS", 20))  # Adjust as needed
 CHUNK_SIZE = 1  # Number of search results to process per LLM call
 
-
 ###############################################################################
 # Pydantic models
 ###############################################################################
@@ -88,21 +87,21 @@ def extract_json(response: str):
     except json.JSONDecodeError:
         return None
 
-
-# Global configurations (adjust as needed)
-MODEL = "ollama/qwen2.5-coder"
-API_BASE = "http://localhost:11434"
-
 def llm_call(prompt: str) -> str:
     """
     Calls the LLM with the provided prompt, returning the text of the LLM response.
+    A system message is added to instruct the model to follow instructions exactly.
     """
+    system_message = "Follow the user's instructions precisely. Respond exactly as requested without any additional commentary."
     print(f"Calling LLM with prompt: {prompt}")
     try:
         response = completion(
             model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            # api_base=API_BASE,
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt}
+            ],
+            api_base=API_BASE,
             api_key=GEMINI_API_KEY
         )
         result = response.choices[0].message.content
@@ -114,7 +113,6 @@ def llm_call(prompt: str) -> str:
     except Exception as e:
         print(f"Error during LLM call: {e}")
         return "Error: Unable to process the request at this time."
-        
 
 def contains_keywords(text: str, keywords: List[str]) -> bool:
     """
@@ -154,14 +152,11 @@ def query_refinement_node(state: State) -> Dict[str, Any]:
     """
     current_query = state.current_query
     result_count = len(state.report.results)
-
     prompt = (
         f"You are assisting a researcher investigating adult content.\n"
-        f"Given the current search query: '{current_query}', and the fact that {result_count} "
-        f"relevant results have been found so far, please suggest a refined search query.\n"
-        f"Try to include specific keywords such as 'scene', 'studio', or other relevant terms "
-        f"that might yield more specific results.\n"
-        f"Output JSON with key 'refined_query'."
+        f"Given the current search query: '{current_query}', and the fact that {result_count} relevant results have been found so far, please suggest a refined search query.\n"
+        "Include specific keywords such as 'scene', 'studio', or other relevant terms to yield more specific results.\n"
+        "Return only a valid JSON object with the key 'refined_query'. Do not include any additional commentary."
     )
     response = llm_call(prompt)
     extracted_json = extract_json(response)
@@ -171,7 +166,7 @@ def query_refinement_node(state: State) -> Dict[str, Any]:
     except ValidationError as e:
         print(f"Validation error in query refinement: {e}")
         refined_query = current_query
-    
+
     print(f"Refined query: {refined_query}")
 
     new_previous_queries = state.previous_queries + [refined_query]
@@ -188,10 +183,8 @@ def database_selection_node(state: State) -> Dict[str, Any]:
     """
     current_query = state.current_query
     prompt = (
-        f"Generate a search query that might reveal websites or databases with "
-        f"information about '{current_query}'. Use terms like 'adult database', "
-        f"'porn site', or specific known adult content platforms. Output JSON "
-        f"with key 'search_query'."
+        f"Generate a search query that might reveal websites or databases with information about '{current_query}'. Use terms like 'adult database', 'porn site', or specific known adult content platforms.\n"
+        "Return only a valid JSON object with the key 'search_query'. Do not include any additional commentary."
     )
     response = llm_call(prompt)
     extracted_json = extract_json(response)
@@ -243,7 +236,7 @@ def search_node(state: State) -> Dict[str, Any]:
             query = f"site:{db['url']} {state.current_query}"
         else:
             query = state.current_query
-        
+
         print(f"Searching with query: {query}")
         if query in search_cache:
             print(f"Using cached results for query: {query}")
@@ -256,7 +249,7 @@ def search_node(state: State) -> Dict[str, Any]:
             except Exception as e:
                 print(f"Error during search_tool.invoke for query '{query}': {e}")
                 results = []
-        
+
         combined_results.extend(results)
 
     return {"search_results": combined_results, "search_cache": search_cache}
@@ -285,7 +278,6 @@ def data_processing_node(state: State) -> Dict[str, Any]:
         link = result.get('link', '')
         snippet = result.get('snippet', '')
 
-        # Updated prompt to include description and reason_for_inclusion
         prompt = (
             f"You are analyzing a search result in relation to the query: '{state.original_query}'.\n\n"
             "Search result:\n"
@@ -293,23 +285,23 @@ def data_processing_node(state: State) -> Dict[str, Any]:
             f"Link: {link}\n"
             f"Snippet: {snippet}\n\n"
             "Determine if this result references a scene that matches the query.\n"
-            "For example, if the query specifies a performer and genre (e.g., 'fetish scenes with Rebecca Linares'), "
-            "the scene should feature that performer and align with the genre.\n"
-            "If it matches, extract:\n"
-            "- scene name (as 'scene')\n"
-            "- studio or production company (as 'studio')\n"
-            "- direct link (as 'link')\n"
-            "- description: a brief description of the scene\n"
-            "- reason_for_inclusion: why this scene was included based on the query\n"
-            "- relevance: 'yes'\n"
-            "If it does not match, return:\n"
-            "- relevance: 'no'\n"
-            "- scene: null\n"
-            "- studio: null\n"
-            "- link: null\n"
-            "- description: null\n"
-            "- reason_for_inclusion: null\n"
-            "Return a JSON object with keys [relevance, scene, studio, link, description, reason_for_inclusion]."
+            "For example, if the query specifies a performer and genre (e.g., 'fetish scenes with Rebecca Linares'), the scene should feature that performer and align with the genre.\n"
+            "However, if the query explicitly mentions a type of fetish, genre, or action that is not part of the scene, it should not be a match.\n"
+            "If it matches, extract the following details:\n"
+            " - scene (scene name)\n"
+            " - studio (studio or production company)\n"
+            " - link (direct link to the scene)\n"
+            " - description (brief description of the scene)\n"
+            " - reason_for_inclusion (why this scene was included based on the query)\n"
+            " - relevance (should be 'yes')\n"
+            "If it does not match, return the following with null values:\n"
+            " - relevance (should be 'no')\n"
+            " - scene: null\n"
+            " - studio: null\n"
+            " - link: null\n"
+            " - description: null\n"
+            " - reason_for_inclusion: null\n"
+            "Return only a valid JSON object with the keys: relevance, scene, studio, link, description, reason_for_inclusion. Do not include any additional text."
         )
         response = llm_call(prompt)
         extracted_data = extract_json(response)
@@ -420,8 +412,8 @@ def review_node(state: State) -> Dict[str, Any]:
         "We have collected adult scene data from various domains.\n"
         f"Current domain usage:\n{json.dumps(domain_usage, indent=2)}\n\n"
         f"Domains excluded so far: {state.excluded_domains}\n"
-        "Please reflect if we are missing important domains or if we have overused certain domains.\n"
-        "Provide a short rationale or next-step advice in JSON under key 'rationale'."
+        "Please analyze if there are any important domains missing or if certain domains have been overused.\n"
+        "Return only a valid JSON object with the key 'rationale' that provides a brief explanation or next-step advice. Do not include any additional commentary."
     )
     coverage_response = llm_call(coverage_prompt)
     coverage_json = extract_json(coverage_response)
@@ -458,7 +450,6 @@ def quality_check_node(state: State) -> Dict[str, Any]:
 
     print(f"Step {state.step_count}/{state.max_steps}: {current_results} results found. Next node: {next_node}")
     return {"step_count": state.step_count, "next_node": next_node}
-
 
 ###############################################################################
 # Graph Definition
