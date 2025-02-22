@@ -16,8 +16,10 @@ load_dotenv()
 # Set MODEL to use local Ollama model (or configure as needed)
 MODEL = os.getenv("MODEL", "ollama/qwen2.5-coder")
 API_BASE = os.getenv("API_BASE", "http://localhost:11434")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 MAX_STEPS = int(os.getenv("MAX_STEPS", 20))  # Adjust as needed
-CHUNK_SIZE = 5  # Number of search results to process per LLM call
+CHUNK_SIZE = 1  # Number of search results to process per LLM call
+
 
 ###############################################################################
 # Pydantic models
@@ -86,6 +88,11 @@ def extract_json(response: str):
     except json.JSONDecodeError:
         return None
 
+
+# Global configurations (adjust as needed)
+MODEL = "ollama/qwen2.5-coder"
+API_BASE = "http://localhost:11434"
+
 def llm_call(prompt: str) -> str:
     """
     Calls the LLM with the provided prompt, returning the text of the LLM response.
@@ -95,14 +102,19 @@ def llm_call(prompt: str) -> str:
         response = completion(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
-            api_base=API_BASE
+            # api_base=API_BASE,
+            api_key=GEMINI_API_KEY
         )
         result = response.choices[0].message.content
+        if result is None:
+            print("LLM returned None response")
+            return "Error: LLM returned no content."
         print(f"LLM response: {result}")
         return result
     except Exception as e:
         print(f"Error during LLM call: {e}")
         return "Error: Unable to process the request at this time."
+        
 
 def contains_keywords(text: str, keywords: List[str]) -> bool:
     """
@@ -268,42 +280,53 @@ def data_processing_node(state: State) -> Dict[str, Any]:
     print(f"Processing {len(filtered_results)} filtered search results")
     new_results_found = False
 
-    for i in range(0, len(filtered_results), CHUNK_SIZE):
-        chunk = filtered_results[i:i + CHUNK_SIZE]
-        results_text = "\n".join([
-            f"{idx+1}. Title: {res.get('title','')}\n   Link: {res.get('link','')}\n   Snippet: {res.get('snippet','')}"
-            for idx, res in enumerate(chunk)
-        ])
+    for result in filtered_results:
+        title = result.get('title', '')
+        link = result.get('link', '')
+        snippet = result.get('snippet', '')
 
+        # Updated prompt with explicit relevance check
         prompt = (
-            "You are extracting data about specific adult film scenes.\n\n"
-            "Below are some search results:\n"
-            f"{results_text}\n\n"
-            "Extract:\n- scene name (as 'scene')\n- studio or production company (as 'studio')\n"
-            "- direct link (as 'link')\n\n"
-            "Return a JSON array of objects with keys [scene, studio, link]. "
-            "If a result does not appear to reference an actual original query, omit it."
+            f"You are analyzing a search result in relation to the query: '{state.original_query}'.\n\n"
+            "Search result:\n"
+            f"Title: {title}\n"
+            f"Link: {link}\n"
+            f"Snippet: {snippet}\n\n"
+            "Determine if this result references a scene that matches the query.\n"
+            "For example, if the query specifies a performer and genre (e.g., 'fetish scenes with Rebecca Linares'), "
+            "the scene should feature that performer and align with the genre.\n"
+            "If it matches, extract:\n"
+            "- scene name (as 'scene')\n"
+            "- studio or production company (as 'studio')\n"
+            "- direct link (as 'link')\n"
+            "- relevance: 'yes'\n"
+            "If it does not match, return:\n"
+            "- relevance: 'no'\n"
+            "- scene: null\n"
+            "- studio: null\n"
+            "- link: null\n"
+            "Return a JSON object with keys [relevance, scene, studio, link]."
         )
         response = llm_call(prompt)
-        extracted_scenes = extract_json(response)
-        if not isinstance(extracted_scenes, list):
-            extracted_scenes = []
+        extracted_data = extract_json(response)
 
-        for scene_data in extracted_scenes:
-            try:
-                scene_info = SceneInfo(**scene_data)
-                scene = {
-                    "scene": scene_info.scene,
-                    "studio": scene_info.studio,
-                    "link": scene_info.link
-                }
-                domain = urlparse(scene["link"]).netloc
-                scene["verification"] = f"Source: {domain}, manual verification needed"
+        # Validate and process the extracted data
+        if isinstance(extracted_data, dict) and extracted_data.get('relevance') == 'yes':
+            scene_data = {
+                "scene": extracted_data.get('scene', ''),
+                "studio": extracted_data.get('studio', ''),
+                "link": extracted_data.get('link', '')
+            }
+            # Ensure required fields are non-empty before adding to report
+            if scene_data['scene'] and scene_data['link']:
+                domain = urlparse(scene_data["link"]).netloc
+                scene_data["verification"] = f"Source: {domain}, manual verification needed"
 
-                if not any(r.get("link") == scene["link"] for r in report.results):
-                    report.results.append(scene)
+                # Check for duplicates before adding
+                if not any(r.get("link") == scene_data["link"] for r in report.results):
+                    report.results.append(scene_data)
                     new_results_found = True
-                    print(f"Added scene: {scene['scene']} (Studio: {scene['studio']}, Link: {scene['link']})")
+                    print(f"Added scene: {scene_data['scene']} (Studio: {scene_data['studio']}, Link: {scene_data['link']})")
 
                     if domain and domain not in report.sources:
                         report.sources.append(domain)
@@ -315,10 +338,7 @@ def data_processing_node(state: State) -> Dict[str, Any]:
                 if domain:
                     domain_usage[domain] = domain_usage.get(domain, 0) + 1
 
-            except ValidationError as e:
-                print(f"Validation error for scene data {scene_data}: {e}")
-                continue
-
+    # Update consecutive count based on whether new results were found
     if new_results_found:
         print("New relevant results found. Resetting consecutive_no_new_results.")
         consecutive_count = 0
