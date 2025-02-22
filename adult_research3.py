@@ -285,7 +285,7 @@ def data_processing_node(state: State) -> Dict[str, Any]:
         link = result.get('link', '')
         snippet = result.get('snippet', '')
 
-        # Updated prompt with explicit relevance check
+        # Updated prompt to include description and reason_for_inclusion
         prompt = (
             f"You are analyzing a search result in relation to the query: '{state.original_query}'.\n\n"
             "Search result:\n"
@@ -299,13 +299,17 @@ def data_processing_node(state: State) -> Dict[str, Any]:
             "- scene name (as 'scene')\n"
             "- studio or production company (as 'studio')\n"
             "- direct link (as 'link')\n"
+            "- description: a brief description of the scene\n"
+            "- reason_for_inclusion: why this scene was included based on the query\n"
             "- relevance: 'yes'\n"
             "If it does not match, return:\n"
             "- relevance: 'no'\n"
             "- scene: null\n"
             "- studio: null\n"
             "- link: null\n"
-            "Return a JSON object with keys [relevance, scene, studio, link]."
+            "- description: null\n"
+            "- reason_for_inclusion: null\n"
+            "Return a JSON object with keys [relevance, scene, studio, link, description, reason_for_inclusion]."
         )
         response = llm_call(prompt)
         extracted_data = extract_json(response)
@@ -315,7 +319,9 @@ def data_processing_node(state: State) -> Dict[str, Any]:
             scene_data = {
                 "scene": extracted_data.get('scene', ''),
                 "studio": extracted_data.get('studio', ''),
-                "link": extracted_data.get('link', '')
+                "link": extracted_data.get('link', ''),
+                "description": extracted_data.get('description', ''),
+                "reason_for_inclusion": extracted_data.get('reason_for_inclusion', '')
             }
             # Ensure required fields are non-empty before adding to report
             if scene_data['scene'] and scene_data['link']:
@@ -354,6 +360,49 @@ def data_processing_node(state: State) -> Dict[str, Any]:
         "consecutive_no_new_results": consecutive_count,
         "domain_usage": domain_usage
     }
+
+def response_node(state: State) -> Dict[str, Any]:
+    """
+    Final node: outputs the final aggregated report, generates a Markdown report,
+    and saves it to the "reports" folder.
+    """
+    print("Generating final report")
+    report = state.report
+
+    # Generate Markdown report with new fields
+    md_content = f"# Report for Query: {report.query}\n\n"
+    md_content += "## Results\n"
+    for result in report.results:
+        md_content += f"- **Scene:** {result['scene']}\n"
+        md_content += f"  - **Studio:** {result['studio']}\n"
+        md_content += f"  - **Link:** {result['link']}\n"
+        md_content += f"  - **Description:** {result.get('description', 'N/A')}\n"
+        md_content += f"  - **Reason for Inclusion:** {result.get('reason_for_inclusion', 'N/A')}\n"
+        md_content += f"  - **Verification:** {result['verification']}\n\n"
+    md_content += "## Sources\n"
+    for source in report.sources:
+        md_content += f"- {source}\n"
+    md_content += "\n## Notes\n"
+    md_content += report.notes if report.notes else "No additional notes."
+
+    # Ensure reports folder exists
+    os.makedirs("reports", exist_ok=True)
+
+    # Generate filename
+    query_slug = re.sub(r'[^\w\-_\.]', '_', report.query)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"reports/report_{query_slug}_{timestamp}.md"
+
+    # Write to file with error handling
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(md_content)
+        print(f"Report saved to {filename}")
+    except Exception as e:
+        print(f"Error saving report: {e}")
+
+    print(f"Final report - Query: {report.query}, Results: {len(report.results)}, Sources: {len(report.sources)}")
+    return {"report": report}
 
 def review_node(state: State) -> Dict[str, Any]:
     """
@@ -410,46 +459,6 @@ def quality_check_node(state: State) -> Dict[str, Any]:
     print(f"Step {state.step_count}/{state.max_steps}: {current_results} results found. Next node: {next_node}")
     return {"step_count": state.step_count, "next_node": next_node}
 
-def response_node(state: State) -> Dict[str, Any]:
-    """
-    Final node: outputs the final aggregated report, generates a Markdown report,
-    and saves it to the "reports" folder.
-    """
-    print("Generating final report")
-    report = state.report
-
-    # Generate Markdown report
-    md_content = f"# Report for Query: {report.query}\n\n"
-    md_content += "## Results\n"
-    for result in report.results:
-        md_content += f"- **Scene:** {result['scene']}\n"
-        md_content += f"  - **Studio:** {result['studio']}\n"
-        md_content += f"  - **Link:** {result['link']}\n"
-        md_content += f"  - **Verification:** {result['verification']}\n\n"
-    md_content += "## Sources\n"
-    for source in report.sources:
-        md_content += f"- {source}\n"
-    md_content += "\n## Notes\n"
-    md_content += report.notes if report.notes else "No additional notes."
-
-    # Ensure reports folder exists
-    os.makedirs("reports", exist_ok=True)
-
-    # Generate filename
-    query_slug = re.sub(r'[^\w\-_\.]', '_', report.query)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"reports/report_{query_slug}_{timestamp}.md"
-
-    # Write to file with error handling
-    try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(md_content)
-        print(f"Report saved to {filename}")
-    except Exception as e:
-        print(f"Error saving report: {e}")
-
-    print(f"Final report - Query: {report.query}, Results: {len(report.results)}, Sources: {len(report.sources)}")
-    return {"report": report}
 
 ###############################################################################
 # Graph Definition
@@ -499,7 +508,7 @@ def run_agent(query: str) -> Dict[str, Any]:
     return final_state.report
 
 if __name__ == "__main__":
-    sample_query = "Find fetish scenes with Rebecca Linares"
+    sample_query = "Find pegging scenes with Rebecca Linares"
     report = run_agent(sample_query)
     print("\n=== Final Report ===")
     print(f"Query: {report.query}")
