@@ -13,17 +13,29 @@ from pydantic import BaseModel, Field, ValidationError
 # Load environment variables from .env file
 load_dotenv()
 
-# Set MODEL to use local Ollama model (or configure as needed)
+# =============================================================================
+# Configuration Section
+# =============================================================================
 MODEL = os.getenv("MODEL", "ollama/qwen2.5-coder")
 API_BASE = os.getenv("API_BASE", "http://localhost:11434")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-MAX_STEPS = int(os.getenv("MAX_STEPS", 20))  # Adjust as needed
+MAX_STEPS = int(os.getenv("MAX_STEPS", 20))  # Maximum steps for the workflow
 CHUNK_SIZE = 1  # Number of search results to process per LLM call
 
-###############################################################################
-# Pydantic models
-###############################################################################
+TARGET_RESULTS = 3       # Number of results required to stop search
+NO_RESULT_LIMIT = 6      # Number of consecutive iterations with no new results before stopping
+RECURSION_LIMIT = 100     # Recursion limit for the graph
+USAGE_THRESHOLD = 3      # Threshold for domain usage to trigger exclusion
 
+QUERY = "Find bisexual mmf scenes with Rebecca Linares"
+
+
+# Initialize search tool
+search_tool = DuckDuckGoSearchResults(output_format="list")
+
+# =============================================================================
+# Pydantic models
+# =============================================================================
 class Report(BaseModel):
     query: str = ""
     results: List[Dict[str, str]] = Field(default_factory=list)
@@ -33,7 +45,6 @@ class Report(BaseModel):
 class State(BaseModel):
     report: Report = Field(default_factory=Report)
     current_query: str = ""
-    databases: List[Dict[str, str]] = Field(default_factory=list)
     search_results: List[Dict[str, str]] = Field(default_factory=list)
     step_count: int = 0
     max_steps: int = MAX_STEPS
@@ -63,10 +74,9 @@ class SceneInfo(BaseModel):
     studio: str
     link: str
 
-###############################################################################
+# =============================================================================
 # Helper functions
-###############################################################################
-
+# =============================================================================
 def extract_json(response: str):
     """
     Extract JSON from the response string.
@@ -101,7 +111,7 @@ def llm_call(prompt: str) -> str:
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}
             ],
-            api_base=API_BASE,
+            # api_base=API_BASE,
             api_key=GEMINI_API_KEY
         )
         result = response.choices[0].message.content
@@ -122,17 +132,15 @@ def contains_keywords(text: str, keywords: List[str]) -> bool:
     text_lower = text.lower()
     return any(keyword.lower() in text_lower for keyword in keywords)
 
-###############################################################################
+# =============================================================================
 # Node Functions
-###############################################################################
-
+# =============================================================================
 def initialize_state_node(state: State) -> Dict[str, Any]:
     query = state.original_query
     print(f"Initializing state with query: {query}")
     return {
         "report": {"query": query, "results": [], "sources": [], "notes": ""},
         "current_query": query,
-        "databases": [],
         "search_results": [],
         "step_count": 0,
         "max_steps": MAX_STEPS,
@@ -175,84 +183,34 @@ def query_refinement_node(state: State) -> Dict[str, Any]:
         "previous_queries": new_previous_queries
     }
 
-def database_selection_node(state: State) -> Dict[str, Any]:
-    """
-    Asks the LLM to generate a search query for adult websites or databases
-    that might contain info about the current query, then runs a search
-    to identify relevant domains.
-    """
-    current_query = state.current_query
-    prompt = (
-        f"Generate a search query that might reveal websites or databases with information about '{current_query}'. Use terms like 'adult database', 'porn site', or specific known adult content platforms.\n"
-        "Return only a valid JSON object with the key 'search_query'. Do not include any additional commentary."
-    )
-    response = llm_call(prompt)
-    extracted_json = extract_json(response)
-
-    try:
-        search_query_data = SearchQuery(**(extracted_json or {}))
-        search_query = search_query_data.search_query.strip()
-    except ValidationError as e:
-        print(f"Validation error in database selection: {e}")
-        search_query = current_query
-
-    print(f"Search query for databases: {search_query}")
-
-    try:
-        results = search_tool.invoke(search_query)
-        print(f"Search results for databases: {results}")
-    except Exception as e:
-        print(f"Error during search_tool.invoke: {e}")
-        results = []
-
-    domains = []
-    for result in results:
-        url = result.get('link', '')
-        domain = urlparse(url).netloc
-        if domain and domain not in domains:
-            domains.append(domain)
-
-    all_domains = list(set(domains + state.useful_databases))
-    databases = [{"type": "site", "url": domain} for domain in all_domains] + [{"type": "general"}]
-    print(f"Selected databases: {databases}")
-
-    return {"databases": databases}
-
 def search_node(state: State) -> Dict[str, Any]:
     """
-    Searches each selected database (domain) or performs a general search 
-    for the current_query. Skips any domains in the excluded_domains list.
+    Performs a general search for the current_query while excluding domains present in state.excluded_domains.
+    Exclusion is done by appending '-site:' clauses to the search query.
     Uses search_cache to avoid redundant searches.
     """
-    combined_results = []
-    excluded_domains = set(state.excluded_domains)
+    excluded_domains = state.excluded_domains
+    query = state.current_query
+    if excluded_domains:
+        exclusion_clause = " ".join(f"-site:{domain}" for domain in excluded_domains)
+        query_with_exclusion = f"{query} {exclusion_clause}"
+    else:
+        query_with_exclusion = query
+    print(f"Searching with query: {query_with_exclusion}")
     search_cache = dict(state.search_cache)  # Copy existing cache
-
-    for db in state.databases:
-        if db["type"] == "site":
-            if db["url"] in excluded_domains:
-                print(f"Skipping domain {db['url']} because it is excluded.")
-                continue
-            query = f"site:{db['url']} {state.current_query}"
-        else:
-            query = state.current_query
-
-        print(f"Searching with query: {query}")
-        if query in search_cache:
-            print(f"Using cached results for query: {query}")
-            results = search_cache[query]
-        else:
-            try:
-                results = search_tool.invoke(query)
-                print(f"Search results: {results}")
-                search_cache[query] = results
-            except Exception as e:
-                print(f"Error during search_tool.invoke for query '{query}': {e}")
-                results = []
-
-        combined_results.extend(results)
-
-    return {"search_results": combined_results, "search_cache": search_cache}
+    if query_with_exclusion in search_cache:
+        print(f"Using cached results for query: {query_with_exclusion}")
+        results = search_cache[query_with_exclusion]
+    else:
+        try:
+            results = search_tool.invoke(query_with_exclusion)
+            print(f"Search results: {results}")
+            search_cache[query_with_exclusion] = results
+        except Exception as e:
+            print(f"Error during search_tool.invoke for query '{query_with_exclusion}': {e}")
+            results = []
+    
+    return {"search_results": results, "search_cache": search_cache}
 
 def data_processing_node(state: State) -> Dict[str, Any]:
     """
@@ -285,7 +243,7 @@ def data_processing_node(state: State) -> Dict[str, Any]:
             f"Link: {link}\n"
             f"Snippet: {snippet}\n\n"
             "Determine if this result references a scene that matches the query.\n"
-            "For example, if the query specifies a performer and genre (e.g., 'fetish scenes with Rebecca Linares'), the scene should feature that performer and align with the genre.\n"
+            "For example, if the query specifies a performer and genre, the scene should feature that performer and align with the genre.\n"
             "However, if the query explicitly mentions a type of fetish, genre, or action that is not part of the scene, it should not be a match.\n"
             "If it matches, extract the following details:\n"
             " - scene (scene name)\n"
@@ -353,6 +311,56 @@ def data_processing_node(state: State) -> Dict[str, Any]:
         "domain_usage": domain_usage
     }
 
+def review_node(state: State) -> Dict[str, Any]:
+    """
+    Reviews the domains used so far. If there's excessive usage of any domain,
+    the LLM is asked to reflect on whether we should exclude it. Also uses the LLM 
+    to see if we're missing any important domains. The updated excluded domains list is returned.
+    """
+    domain_usage = state.domain_usage
+    overused_domains = [dom for dom, count in domain_usage.items() if count >= USAGE_THRESHOLD]
+    new_excluded = set(state.excluded_domains).union(overused_domains)
+
+    coverage_prompt = (
+        "We have collected adult scene data from various domains.\n"
+        f"Current domain usage:\n{json.dumps(domain_usage, indent=2)}\n\n"
+        f"Domains excluded so far: {state.excluded_domains}\n"
+        "Please analyze if there are any important domains missing or if certain domains have been overused.\n"
+        "Return only a valid JSON object with the key 'rationale' that provides a brief explanation or next-step advice. Do not include any additional commentary."
+    )
+    coverage_response = llm_call(coverage_prompt)
+    coverage_json = extract_json(coverage_response)
+    rationale = coverage_json.get("rationale") if isinstance(coverage_json, dict) else None
+    if rationale:
+        print(f"LLM Rationale: {rationale}")
+    else:
+        print("No special rationale from LLM or invalid JSON returned.")
+
+    return {
+        "excluded_domains": list(new_excluded)
+    }
+
+def quality_check_node(state: State) -> Dict[str, Any]:
+    """
+    Checks if we have enough results or if we've tried too many times.
+    If we haven't found anything new for N times, we also stop early.
+    """
+    state.step_count += 1
+    current_results = len(state.report.results)
+    if (
+        state.step_count >= state.max_steps
+        or current_results >= TARGET_RESULTS
+        or state.consecutive_no_new_results >= NO_RESULT_LIMIT
+    ):
+        next_node = "response"
+        if state.consecutive_no_new_results >= NO_RESULT_LIMIT and current_results == 0:
+            state.report.notes = "No relevant results found after multiple refinements."
+    else:
+        next_node = "query_refinement"
+
+    print(f"Step {state.step_count}/{state.max_steps}: {current_results} results found. Next node: {next_node}")
+    return {"step_count": state.step_count, "next_node": next_node}
+
 def response_node(state: State) -> Dict[str, Any]:
     """
     Final node: outputs the final aggregated report, generates a Markdown report,
@@ -396,73 +404,14 @@ def response_node(state: State) -> Dict[str, Any]:
     print(f"Final report - Query: {report.query}, Results: {len(report.results)}, Sources: {len(report.sources)}")
     return {"report": report}
 
-def review_node(state: State) -> Dict[str, Any]:
-    """
-    Reviews the domains used so far. If there's excessive usage of any domain,
-    the LLM is asked to reflect on whether we should exclude it. Also uses the LLM 
-    to see if we're missing any important domains. The updated excluded domains list is returned.
-    """
-    domain_usage = state.domain_usage
-    usage_threshold = 3
-
-    overused_domains = [dom for dom, count in domain_usage.items() if count >= usage_threshold]
-    new_excluded = set(state.excluded_domains).union(overused_domains)
-
-    coverage_prompt = (
-        "We have collected adult scene data from various domains.\n"
-        f"Current domain usage:\n{json.dumps(domain_usage, indent=2)}\n\n"
-        f"Domains excluded so far: {state.excluded_domains}\n"
-        "Please analyze if there are any important domains missing or if certain domains have been overused.\n"
-        "Return only a valid JSON object with the key 'rationale' that provides a brief explanation or next-step advice. Do not include any additional commentary."
-    )
-    coverage_response = llm_call(coverage_prompt)
-    coverage_json = extract_json(coverage_response)
-    rationale = coverage_json.get("rationale") if isinstance(coverage_json, dict) else None
-    if rationale:
-        print(f"LLM Rationale: {rationale}")
-    else:
-        print("No special rationale from LLM or invalid JSON returned.")
-
-    return {
-        "excluded_domains": list(new_excluded)
-    }
-
-def quality_check_node(state: State) -> Dict[str, Any]:
-    """
-    Checks if we have enough results or if we've tried too many times.
-    If we haven't found anything new for N times, we also stop early.
-    """
-    state.step_count += 1
-    target_results = 3
-    current_results = len(state.report.results)
-    no_result_limit = 3
-
-    if (
-        state.step_count >= state.max_steps
-        or current_results >= target_results
-        or state.consecutive_no_new_results >= no_result_limit
-    ):
-        next_node = "response"
-        if state.consecutive_no_new_results >= no_result_limit and current_results == 0:
-            state.report.notes = "No relevant results found after multiple refinements."
-    else:
-        next_node = "query_refinement"
-
-    print(f"Step {state.step_count}/{state.max_steps}: {current_results} results found. Next node: {next_node}")
-    return {"step_count": state.step_count, "next_node": next_node}
-
-###############################################################################
+# =============================================================================
 # Graph Definition
-###############################################################################
-
+# =============================================================================
 from langgraph.pregel import GraphRecursionError
-
-search_tool = DuckDuckGoSearchResults(output_format="list")
 
 workflow = StateGraph(State)
 workflow.add_node("initialize", initialize_state_node)
 workflow.add_node("query_refinement", query_refinement_node)
-workflow.add_node("database_selection", database_selection_node)
 workflow.add_node("search", search_node)
 workflow.add_node("data_processing", data_processing_node)
 workflow.add_node("review_node", review_node)
@@ -471,8 +420,8 @@ workflow.add_node("response", response_node)
 
 workflow.add_edge(START, "initialize")
 workflow.add_edge("initialize", "query_refinement")
-workflow.add_edge("query_refinement", "database_selection")
-workflow.add_edge("database_selection", "search")
+# Removed the database_selection node; now directly transition from query_refinement to search.
+workflow.add_edge("query_refinement", "search")
 workflow.add_edge("search", "data_processing")
 workflow.add_edge("data_processing", "review_node")
 workflow.add_edge("review_node", "quality_check")
@@ -486,21 +435,19 @@ workflow.add_conditional_edges(
 workflow.add_edge("response", END)
 graph = workflow.compile()
 
-###############################################################################
+# =============================================================================
 # Main Agent Function
-###############################################################################
-
+# =============================================================================
 def run_agent(query: str) -> Dict[str, Any]:
     print(f"Starting agent with query: {query}")
     initial_state = State(original_query=query)
-    final_data = graph.invoke(initial_state)
+    final_data = graph.invoke(initial_state, {"recursion_limit": RECURSION_LIMIT})
     final_state = State(**dict(final_data))
     print("Agent execution completed")
     return final_state.report
 
 if __name__ == "__main__":
-    sample_query = "Find pegging scenes with Rebecca Linares"
-    report = run_agent(sample_query)
+    report = run_agent(QUERY)
     print("\n=== Final Report ===")
     print(f"Query: {report.query}")
     print("Results:")
